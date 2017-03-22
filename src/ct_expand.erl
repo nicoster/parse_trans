@@ -48,20 +48,22 @@
 -export([parse_transform/2]).
 
 -export([extract_fun/3,
-         lfun_rewrite/2]).
+    lfun_rewrite/2]).
 
--type form()    :: any().
--type forms()   :: [form()].
+-type form() :: any().
+-type forms() :: [form()].
 -type options() :: [{atom(), any()}].
 
 
 -spec parse_transform(forms(), options()) ->
     forms().
 parse_transform(Forms, Options) ->
-    Trace = ct_trace_opt(Options, Forms),
-    case parse_trans:depth_first(fun(T,F,C,A) ->
-                                         xform_fun(T,F,C,A,Forms, Trace)
-                                 end, [], Forms, Options) of
+    Trace = [c, r, x], %ct_trace_opt(Options, Forms),
+    case parse_trans:depth_first(
+        fun(T, F, C, A) ->
+%%            io:format("-------------------------~n~p, ~p, ~p~n", [T, F, A]),
+            xform_fun(T, F, C, A, Forms, Trace)
+        end, [], Forms, Options) of
         {error, Es} ->
             Es ++ Forms;
         {NewForms, _} ->
@@ -71,10 +73,10 @@ parse_transform(Forms, Options) ->
 ct_trace_opt(Options, Forms) ->
     case proplists:get_value(ct_expand_trace, Options) of
         undefined ->
-            case [Opt || {attribute,_,ct_expand_trace,Opt} <- Forms] of
+            case [Opt || {attribute, _, ct_expand_trace, Opt} <- Forms] of
                 [] ->
                     [];
-                [_|_] = L ->
+                [_ | _] = L ->
                     lists:last(L)
             end;
         Flags when is_list(Flags) ->
@@ -82,23 +84,28 @@ ct_trace_opt(Options, Forms) ->
     end.
 
 xform_fun(application, Form, _Ctxt, Acc, Forms, Trace) ->
+    io:format("app, form:~p~nAcc:~p~n", [Form, Acc]),
     MFA = erl_syntax_lib:analyze_application(Form),
+    io:format("xform-fun: ~p~n", [MFA]),
     case MFA of
-        {?MODULE, {term, 1}} ->
+        {?MODULE, {term, _}} ->
             LFH = fun(Name, Args, Bs) ->
-                          eval_lfun(
-                            extract_fun(Name, length(Args), Forms),
-                            Args, Bs, Forms, Trace)
+                eval_lfun(
+                    extract_fun(Name, length(Args), Forms),
+                    Args, Bs, Forms, Trace)
                   end,
             Args = erl_syntax:application_arguments(Form),
+            io:format("args: ~p~n", [Args]),
             RevArgs = parse_trans:revert(Args),
+            io:format("rev-args: ~p~n", [RevArgs]),
             case erl_eval:exprs(RevArgs, [], {eval, LFH}) of
-                {value, Value,[]} ->
+                {value, Value, _} ->
                     {abstract(Value), Acc};
                 Other ->
-                    parse_trans:error(cannot_evaluate,?LINE,
-                                      [{expr, RevArgs},
-                                       {error, Other}])
+                    io:format("cannot evaluate: ~p~n", [Other]),
+                    parse_trans:error(cannot_evaluate, ?LINE,
+                        [{expr, RevArgs},
+                            {error, Other}])
             end;
         _ ->
             {Form, Acc}
@@ -107,43 +114,47 @@ xform_fun(_, Form, _Ctxt, Acc, _, _) ->
     {Form, Acc}.
 
 extract_fun(Name, Arity, Forms) ->
-    case [F_ || {function,_,N_,A_,_Cs} = F_ <- Forms,
-                N_ == Name, A_ == Arity] of
+    io:format("extract-fun: ~p, ~p~n", [Name, Arity]),
+    case [F_ || {function, _, N_, A_, _Cs} = F_ <- Forms,
+        N_ == Name, A_ == Arity] of
         [] ->
             erlang:error({undef, [{Name, Arity}]});
         [FForm] ->
             FForm
     end.
 
-eval_lfun({function,L,F,_,Clauses}, Args, Bs, Forms, Trace) ->
+eval_lfun({function, L, F, _, Clauses}, Args, Bs, Forms, Trace) ->
+    io:format("eval-fun, L:~p, F:~p, Args:~p Bindings:~p ~nClauses:~p~n", [L, F, Args, Bs, Clauses]),
     try
         begin
             {ArgsV, Bs1} = lists:mapfoldl(
-                             fun(A, Bs_) ->
-                                     {value,AV,Bs1_} =
-                                         erl_eval:expr(A, Bs_, lfh(Forms, Trace)),
-                                     {abstract(AV), Bs1_}
-                             end, Bs, Args),
+                fun(A, Bs_) ->
+                    {value, AV, Bs1_} =
+                        erl_eval:expr(A, Bs_, lfh(Forms, Trace)),
+                    {abstract(AV), Bs1_}
+                end, Bs, Args),
             Expr = {call, L, {'fun', L, {clauses, lfun_rewrite(Clauses, Forms)}}, ArgsV},
             call_trace(Trace =/= [], L, F, ArgsV),
             {value, Ret, _} =
-                erl_eval:expr(Expr, erl_eval:new_bindings(), lfh(Forms, Trace)),
+%%                erl_eval:expr(Expr, erl_eval:new_bindings(), lfh(Forms, Trace)),
+                erl_eval:expr(Expr, Bs, lfh(Forms, Trace)),
             ret_trace(lists:member(r, Trace) orelse lists:member(x, Trace),
-                      L, F, Args, Ret),
+                L, F, Args, Ret),
             %% restore bindings
             {value, Ret, Bs1}
         end
     catch
         error:Err ->
+            io:format("eval-fun exception, err:~p~n", [Err]),
             exception_trace(lists:member(x, Trace), L, F, Args, Err),
             error(Err)
     end.
 
 lfh(Forms, Trace) ->
     {eval, fun(Name, As, Bs1) ->
-                   eval_lfun(
-                     extract_fun(Name, length(As), Forms),
-                     As, Bs1, Forms, Trace)
+        eval_lfun(
+            extract_fun(Name, length(As), Forms),
+            As, Bs1, Forms, Trace)
            end}.
 
 call_trace(false, _, _, _) -> ok;
@@ -152,16 +163,16 @@ call_trace(true, L, F, As) ->
 
 pp_function(F, []) ->
     atom_to_list(F) ++ "()";
-pp_function(F, [A|As]) ->
+pp_function(F, [A | As]) ->
     lists:flatten([atom_to_list(F), "(",
-                   [io_lib:fwrite("~w", [erl_parse:normalise(A)]) |
-                    [[",", io_lib:fwrite("~w", [erl_parse:normalise(A_)])] || A_ <- As]],
-                   ")"]).
+        [io_lib:fwrite("~w", [erl_parse:normalise(A)]) |
+            [[",", io_lib:fwrite("~w", [erl_parse:normalise(A_)])] || A_ <- As]],
+        ")"]).
 
 ret_trace(false, _, _, _, _) -> ok;
 ret_trace(true, L, F, Args, Res) ->
     io:fwrite("ct_expand (~w): returned from ~w/~w: ~w~n",
-              [L, F, length(Args), Res]).
+        [L, F, length(Args), Res]).
 
 exception_trace(false, _, _, _, _) -> ok;
 exception_trace(true, L, F, Args, Err) ->
@@ -170,19 +181,19 @@ exception_trace(true, L, F, Args, Err) ->
 
 lfun_rewrite(Exprs, Forms) ->
     parse_trans:plain_transform(
-      fun({'fun',L,{function,F,A}}) ->
-              {function,_,_,_,Cs} = extract_fun(F, A, Forms),
-              {'fun',L,{clauses, Cs}};
-         (_) ->
-              continue
-      end, Exprs).
+        fun({'fun', L, {function, F, A}}) ->
+            {function, _, _, _, Cs} = extract_fun(F, A, Forms),
+            {'fun', L, {clauses, Cs}};
+            (_) ->
+                continue
+        end, Exprs).
 
 
 %% abstract/1 - modified from erl_eval:abstract/1:
 -type abstract_expr() :: term().
 -spec abstract(Data) -> AbsTerm when
-      Data :: term(),
-      AbsTerm :: abstract_expr().
+    Data :: term(),
+    AbsTerm :: abstract_expr().
 abstract(T) when is_function(T) ->
     case erlang:fun_info(T, module) of
         {module, erl_eval} ->
@@ -195,33 +206,33 @@ abstract(T) when is_function(T) ->
         _ ->
             erlang:error(function_clause)
     end;
-abstract(T) when is_integer(T) -> {integer,0,T};
-abstract(T) when is_float(T) -> {float,0,T};
-abstract(T) when is_atom(T) -> {atom,0,T};
-abstract([]) -> {nil,0};
+abstract(T) when is_integer(T) -> {integer, 0, T};
+abstract(T) when is_float(T) -> {float, 0, T};
+abstract(T) when is_atom(T) -> {atom, 0, T};
+abstract([]) -> {nil, 0};
 abstract(B) when is_bitstring(B) ->
     {bin, 0, [abstract_byte(Byte, 0) || Byte <- bitstring_to_list(B)]};
-abstract([C|T]) when is_integer(C), 0 =< C, C < 256 ->
+abstract([C | T]) when is_integer(C), 0 =< C, C < 256 ->
     abstract_string(T, [C]);
-abstract([H|T]) ->
-    {cons,0,abstract(H),abstract(T)};
+abstract([H | T]) ->
+    {cons, 0, abstract(H), abstract(T)};
 abstract(Tuple) when is_tuple(Tuple) ->
-    {tuple,0,abstract_list(tuple_to_list(Tuple))}.
+    {tuple, 0, abstract_list(tuple_to_list(Tuple))}.
 
-abstract_string([C|T], String) when is_integer(C), 0 =< C, C < 256 ->
-    abstract_string(T, [C|String]);
+abstract_string([C | T], String) when is_integer(C), 0 =< C, C < 256 ->
+    abstract_string(T, [C | String]);
 abstract_string([], String) ->
     {string, 0, lists:reverse(String)};
 abstract_string(T, String) ->
     not_string(String, abstract(T)).
 
-not_string([C|T], Result) ->
+not_string([C | T], Result) ->
     not_string(T, {cons, 0, {integer, 0, C}, Result});
 not_string([], Result) ->
     Result.
 
-abstract_list([H|T]) ->
-    [abstract(H)|abstract_list(T)];
+abstract_list([H | T]) ->
+    [abstract(H) | abstract_list(T)];
 abstract_list([]) ->
     [].
 
